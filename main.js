@@ -234,6 +234,8 @@ function setupLighting() {
 let videoElement;
 let videoTexture;
 let hls;
+let currentMediaUrl = '';
+let isApplyingRemote = false;
 
 function setupVideo() {
     // Create a hidden video element in the DOM
@@ -369,6 +371,7 @@ function loadVideo(url) {
 
     // Handle local file input
     if (url instanceof File) {
+        currentMediaUrl = '';
         const objectUrl = URL.createObjectURL(url);
         videoElement.src = objectUrl;
         videoElement.onloadedmetadata = () => {
@@ -379,6 +382,7 @@ function loadVideo(url) {
 
     // Check file extension/type
     const urlLower = url.toLowerCase();
+    currentMediaUrl = url;
     const isHLS = urlLower.endsWith('.m3u8');
     const isWebM = urlLower.endsWith('.webm');
     const isOgg = urlLower.endsWith('.ogg');
@@ -675,6 +679,7 @@ function createControlPanel() {
         const url = urlInput.value.trim();
         if (url) {
             loadVideo(url);
+            p2pBroadcast({ t: 'load', url });
             toggleControlPanel();
         }
     };
@@ -1414,6 +1419,7 @@ rewindButton.onclick = () => {
     if (!videoElement) return;
     videoElement.currentTime = Math.max(0, videoElement.currentTime - 10);
     showTVOverlay('rewind');
+    if (videoElement && !isApplyingRemote) p2pBroadcast({ t: 'seek', time: videoElement.currentTime });
 };
 
 playPauseButton.onclick = async () => {
@@ -1427,6 +1433,7 @@ playPauseButton.onclick = async () => {
             showTVOverlay('pause');
         }
         updatePlayPauseButton();
+        if (videoElement && !isApplyingRemote) p2pBroadcast({ t: videoElement.paused ? 'pause' : 'play' });
     } catch (e) {
         console.error('Error toggling play/pause:', e);
         showError('Error controlling video playback.');
@@ -1437,6 +1444,7 @@ forwardButton.onclick = () => {
     if (!videoElement) return;
     videoElement.currentTime = Math.min(videoElement.duration || 0, videoElement.currentTime + 10);
     showTVOverlay('forward');
+    if (videoElement && !isApplyingRemote) p2pBroadcast({ t: 'seek', time: videoElement.currentTime });
 };
 
 volumeDownButton.onclick = () => {
@@ -1463,6 +1471,7 @@ progressBar.onclick = (e) => {
     const rect = progressBar.getBoundingClientRect();
     const percent = (e.clientX - rect.left) / rect.width;
     videoElement.currentTime = percent * videoElement.duration;
+    if (!isApplyingRemote) p2pBroadcast({ t: 'seek', time: videoElement.currentTime });
 };
 
 // Animation loop
@@ -1938,3 +1947,218 @@ function updatePictureControl(type) {
     }
     showTVOverlay(type, window[type]);
 }
+
+let p2pIsHost = false;
+let p2pPeers = [];
+function p2pBroadcast(msg) {
+    const data = JSON.stringify(msg);
+    p2pPeers.forEach(p => {
+        if (p.dc && p.dc.readyState === 'open') {
+            try { p.dc.send(data); } catch (_) {}
+        }
+    });
+}
+function p2pApply(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.t === 'load' && typeof msg.url === 'string') {
+        if (msg.url && msg.url !== currentMediaUrl && /^https?:\/\//.test(msg.url)) {
+            isApplyingRemote = true;
+            loadVideo(msg.url);
+            setTimeout(() => { isApplyingRemote = false; }, 500);
+        }
+        return;
+    }
+    if (msg.t === 'seek' && typeof msg.time === 'number' && videoElement) {
+        isApplyingRemote = true;
+        videoElement.currentTime = msg.time;
+        setTimeout(() => { isApplyingRemote = false; }, 100);
+        return;
+    }
+    if (msg.t === 'play' && videoElement) {
+        isApplyingRemote = true;
+        videoElement.play().finally(() => { setTimeout(() => { isApplyingRemote = false; }, 100); });
+        return;
+    }
+    if (msg.t === 'pause' && videoElement) {
+        isApplyingRemote = true;
+        videoElement.pause();
+        setTimeout(() => { isApplyingRemote = false; }, 100);
+        return;
+    }
+    if (msg.t === 'sync') {
+        const u = typeof msg.url === 'string' ? msg.url : '';
+        const tm = typeof msg.time === 'number' ? msg.time : 0;
+        const ps = !!msg.paused;
+        if (u && /^https?:\/\//.test(u) && u !== currentMediaUrl) {
+            isApplyingRemote = true;
+            loadVideo(u);
+            setTimeout(() => {
+                if (videoElement) {
+                    videoElement.currentTime = tm;
+                    if (ps) videoElement.pause(); else videoElement.play();
+                }
+                isApplyingRemote = false;
+            }, 600);
+        } else if (videoElement) {
+            isApplyingRemote = true;
+            videoElement.currentTime = tm;
+            if (ps) videoElement.pause(); else videoElement.play();
+            setTimeout(() => { isApplyingRemote = false; }, 100);
+        }
+        return;
+    }
+}
+function p2pCreatePC() {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun.l.google.com:19302','stun:global.stun.twilio.com:3478'] }] });
+    return pc;
+}
+function p2pEncode(desc) {
+    return JSON.stringify({ type: desc.type, sdp: desc.sdp });
+}
+function p2pDecode(text) {
+    try { const j = JSON.parse(text); return new RTCSessionDescription(j); } catch (_) { return null; }
+}
+function p2pAddPeerFromOffer(offerText, onAnswerReady) {
+    const pc = p2pCreatePC();
+    let dc = null;
+    pc.ondatachannel = e => {
+        dc = e.channel;
+        dc.onmessage = ev => { try { p2pApply(JSON.parse(ev.data)); } catch (_) {} };
+    };
+    const offer = p2pDecode(offerText);
+    if (!offer) return;
+    pc.setRemoteDescription(offer).then(() => pc.createAnswer()).then(a => pc.setLocalDescription(a)).then(() => {
+        const done = () => onAnswerReady(p2pEncode(pc.localDescription));
+        if (pc.iceGatheringState === 'complete') done(); else pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') done(); };
+    });
+    pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
+            p2pPeers = p2pPeers.filter(p => p.pc !== pc);
+        }
+    };
+    p2pPeers.push({ pc, dc });
+}
+function p2pNewPeerOffer(onOfferReady) {
+    const pc = p2pCreatePC();
+    const dc = pc.createDataChannel('d');
+    dc.onmessage = ev => { try { p2pApply(JSON.parse(ev.data)); } catch (_) {} };
+    const peer = { pc, dc };
+    p2pPeers.push(peer);
+    pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+            const u = currentMediaUrl;
+            const tm = videoElement ? videoElement.currentTime : 0;
+            const ps = videoElement ? videoElement.paused : true;
+            p2pBroadcast({ t: 'sync', url: u, time: tm, paused: ps });
+        }
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
+            p2pPeers = p2pPeers.filter(p => p.pc !== pc);
+        }
+    };
+    pc.createOffer().then(o => pc.setLocalDescription(o)).then(() => {
+        const done = () => onOfferReady(p2pEncode(pc.localDescription));
+        if (pc.iceGatheringState === 'complete') done(); else pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') done(); };
+    });
+    return peer;
+}
+function p2pAcceptAnswerForLatest(answerText) {
+    const last = p2pPeers[p2pPeers.length - 1];
+    if (!last) return;
+    const ans = p2pDecode(answerText);
+    if (!ans) return;
+    last.pc.setRemoteDescription(ans);
+}
+function p2pInitUI() {
+    const box = document.createElement('div');
+    box.style.position = 'fixed';
+    box.style.bottom = '12px';
+    box.style.right = '12px';
+    box.style.background = 'rgba(51,51,51,0.75)';
+    box.style.backdropFilter = 'blur(24px) saturate(1.5)';
+    box.style.border = '1px solid #ccc';
+    box.style.borderRadius = '12px';
+    box.style.padding = '10px';
+    box.style.minWidth = '280px';
+    box.style.color = '#ffffffbf';
+    box.style.fontFamily = 'system-ui, sans-serif';
+    const title = document.createElement('div');
+    title.textContent = 'Room';
+    title.style.fontWeight = '600';
+    title.style.textAlign = 'center';
+    title.style.marginBottom = '8px';
+    const row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.gap = '8px';
+    row.style.marginBottom = '8px';
+    const hostBtn = document.createElement('button');
+    hostBtn.textContent = 'Host';
+    const joinBtn = document.createElement('button');
+    joinBtn.textContent = 'Join';
+    ;[hostBtn, joinBtn].forEach(b => { b.style.flex = '1'; b.style.padding = '6px'; b.style.border = 'none'; b.style.borderRadius = '6px'; b.style.cursor = 'pointer'; b.style.background = '#007aff'; b.style.color = 'white'; });
+    const status = document.createElement('div');
+    status.style.fontSize = '12px';
+    status.style.opacity = '0.8';
+    status.textContent = 'Peers: 0';
+    const offerArea = document.createElement('textarea');
+    offerArea.placeholder = 'Offer or Answer';
+    offerArea.style.width = '100%';
+    offerArea.style.height = '90px';
+    offerArea.style.resize = 'vertical';
+    offerArea.style.background = '#222';
+    offerArea.style.color = '#fff';
+    offerArea.style.border = 'none';
+    offerArea.style.borderRadius = '6px';
+    offerArea.style.padding = '8px';
+    offerArea.style.margin = '6px 0';
+    const hostActions = document.createElement('div');
+    hostActions.style.display = 'none';
+    hostActions.style.gap = '8px';
+    const newOfferBtn = document.createElement('button');
+    newOfferBtn.textContent = 'New Peer Offer';
+    const acceptAnswerBtn = document.createElement('button');
+    acceptAnswerBtn.textContent = 'Accept Answer';
+    ;[newOfferBtn, acceptAnswerBtn].forEach(b => { b.style.flex = '1'; b.style.padding = '6px'; b.style.border = 'none'; b.style.borderRadius = '6px'; b.style.cursor = 'pointer'; b.style.background = '#4caf50'; b.style.color = 'white'; });
+    hostActions.appendChild(newOfferBtn);
+    hostActions.appendChild(acceptAnswerBtn);
+    const joinActions = document.createElement('div');
+    joinActions.style.display = 'none';
+    joinActions.style.gap = '8px';
+    const pasteOfferBtn = document.createElement('button');
+    pasteOfferBtn.textContent = 'Paste Offer → Get Answer';
+    pasteOfferBtn.style.flex = '1';
+    pasteOfferBtn.style.padding = '6px';
+    pasteOfferBtn.style.border = 'none';
+    pasteOfferBtn.style.borderRadius = '6px';
+    pasteOfferBtn.style.cursor = 'pointer';
+    pasteOfferBtn.style.background = '#9c27b0';
+    pasteOfferBtn.style.color = 'white';
+    joinActions.appendChild(pasteOfferBtn);
+    row.appendChild(hostBtn);
+    row.appendChild(joinBtn);
+    box.appendChild(title);
+    box.appendChild(row);
+    box.appendChild(status);
+    box.appendChild(offerArea);
+    box.appendChild(hostActions);
+    box.appendChild(joinActions);
+    document.body.appendChild(box);
+    function refresh() { status.textContent = 'Peers: ' + p2pPeers.filter(p => p.dc && p.dc.readyState === 'open').length; }
+    setInterval(refresh, 1000);
+    hostBtn.onclick = () => { p2pIsHost = true; hostActions.style.display = 'flex'; joinActions.style.display = 'none'; };
+    joinBtn.onclick = () => { p2pIsHost = false; hostActions.style.display = 'none'; joinActions.style.display = 'flex'; };
+    newOfferBtn.onclick = () => {
+        p2pNewPeerOffer(txt => { offerArea.value = txt; });
+    };
+    acceptAnswerBtn.onclick = () => {
+        const t = offerArea.value.trim();
+        if (!t) return;
+        p2pAcceptAnswerForLatest(t);
+    };
+    pasteOfferBtn.onclick = () => {
+        const t = offerArea.value.trim();
+        if (!t) return;
+        p2pAddPeerFromOffer(t, ans => { offerArea.value = ans; });
+    };
+}
+
+p2pInitUI();
